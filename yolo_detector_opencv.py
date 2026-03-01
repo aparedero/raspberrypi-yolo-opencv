@@ -2,12 +2,15 @@
 """
 Detector de objetos YOLO con OpenCV DNN para Raspberry Pi 4.
 Soporta modo GUI y headless con síntesis de voz en español.
+Autoría: Alejandro Paredero - alejandro.paredero@cunef.edu
 """
 
 import os
 import sys
 import time
 import threading
+import subprocess
+import shutil
 from pathlib import Path
 from datetime import datetime
 import configparser
@@ -185,6 +188,102 @@ class SintesisVoz:
 
 class DetectorCamara:
     """Maneja la detección y verificación de la cámara web"""
+
+    class CapturaConProceso:
+        """Wrapper para gestionar una captura OpenCV asociada a un proceso externo."""
+
+        def __init__(self, cap, proc=None, descripcion=""):
+            self._cap = cap
+            self._proc = proc
+            self.descripcion = descripcion
+
+        def isOpened(self):
+            return self._cap is not None and self._cap.isOpened()
+
+        def read(self):
+            return self._cap.read()
+
+        def set(self, prop_id, value):
+            try:
+                return self._cap.set(prop_id, value)
+            except Exception:
+                return False
+
+        def release(self):
+            try:
+                if self._cap is not None:
+                    self._cap.release()
+            finally:
+                if self._proc is not None:
+                    try:
+                        self._proc.terminate()
+                        self._proc.wait(timeout=2)
+                    except Exception:
+                        try:
+                            self._proc.kill()
+                        except Exception:
+                            pass
+
+    class CapturaPicamera2:
+        """Wrapper para captura CSI usando Picamera2."""
+
+        def __init__(self, picam):
+            self._picam = picam
+            self.descripcion = "CSI/Picamera2"
+            self._lock = threading.Lock()
+            self._running = True
+            self._latest_frame = None
+            self._last_frame_time = 0.0
+            self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+            self._reader_thread.start()
+
+        def _reader_loop(self):
+            while self._running:
+                try:
+                    frame_rgb = self._picam.capture_array()
+                    if frame_rgb is None or frame_rgb.size == 0:
+                        time.sleep(0.005)
+                        continue
+
+                    frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                    with self._lock:
+                        self._latest_frame = frame_bgr
+                        self._last_frame_time = time.time()
+                except Exception:
+                    time.sleep(0.01)
+
+        def isOpened(self):
+            return self._picam is not None and self._running
+
+        def read(self):
+            timeout = 0.25
+            inicio = time.time()
+            while self._running and (time.time() - inicio) < timeout:
+                with self._lock:
+                    if self._latest_frame is not None:
+                        return True, self._latest_frame.copy()
+                time.sleep(0.005)
+            return False, None
+
+        def set(self, prop_id, value):
+            return False
+
+        def release(self):
+            self._running = False
+            try:
+                if self._reader_thread.is_alive():
+                    self._reader_thread.join(timeout=1.0)
+            except Exception:
+                pass
+            if self._picam is not None:
+                try:
+                    self._picam.stop()
+                except Exception:
+                    pass
+                try:
+                    self._picam.close()
+                except Exception:
+                    pass
     
     @staticmethod
     def listar_dispositivos_video():
@@ -193,44 +292,187 @@ class DetectorCamara:
         dispositivos = glob.glob('/dev/video*')
         if dispositivos:
             print(f"[INFO] Dispositivos de video encontrados: {', '.join(dispositivos)}")
-            return True
+            return dispositivos
         else:
             print("[WARN] No se encontraron dispositivos /dev/video*")
-            return False
+            return []
+
+    @staticmethod
+    def _abrir_csi_libcamera(ancho=640, alto=480, fps=30):
+        """Intenta abrir la cámara CSI mediante libcamerasrc (GStreamer)."""
+        pipeline = (
+            f"libcamerasrc ! video/x-raw,width={ancho},height={alto},framerate={fps}/1 "
+            "! videoconvert ! appsink drop=true max-buffers=1 sync=false"
+        )
+        try:
+            cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+            if not cap.isOpened():
+                cap.release()
+                return None
+
+            ret, frame = cap.read()
+            if ret and frame is not None and frame.size > 0:
+                print("[INFO] Cámara CSI detectada y abierta por libcamera")
+                return cap
+
+            cap.release()
+        except Exception as e:
+            print(f"[WARN] Falló apertura CSI con libcamera: {e}")
+
+        return None
+
+    @staticmethod
+    def _abrir_csi_picamera2(ancho=640, alto=480, fps=30):
+        """Intenta abrir la cámara CSI con Picamera2 (backend recomendado en Raspberry Pi)."""
+        try:
+            from picamera2 import Picamera2
+        except Exception:
+            return None
+
+        try:
+            picam = Picamera2()
+            config_video = picam.create_video_configuration(
+                main={"size": (ancho, alto), "format": "RGB888"},
+                controls={"FrameRate": float(fps)}
+            )
+            picam.configure(config_video)
+            picam.start()
+            time.sleep(0.3)
+
+            captura = DetectorCamara.CapturaPicamera2(picam)
+            ok, test = captura.read()
+            if not ok or test is None or test.size == 0:
+                captura.release()
+                return None
+            print("[INFO] Cámara CSI detectada y abierta por Picamera2")
+            return captura
+        except Exception as e:
+            print(f"[WARN] Falló apertura CSI con Picamera2: {e}")
+            return None
+
+    @staticmethod
+    def _abrir_csi_rpicam(ancho=640, alto=480, fps=30):
+        """Intenta abrir la cámara CSI usando rpicam-vid y recepción UDP en OpenCV."""
+        if shutil.which("rpicam-vid") is None:
+            return None
+
+        # Evitar saturación del buffer: emitir a una tasa moderada según FPS de detección
+        fps_detect = config.getint('Deteccion', 'fps_objetivo', fallback=1)
+        fps_stream = max(2, min(10, fps_detect * 2))
+
+        puerto = 5600
+        cmd = [
+            "rpicam-vid",
+            "-n",
+            "-t", "0",
+            "--width", str(ancho),
+            "--height", str(alto),
+            "--framerate", str(fps_stream),
+            "--codec", "mjpeg",
+            "-o", f"udp://127.0.0.1:{puerto}",
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            time.sleep(0.8)
+
+            cap_url = f"udp://127.0.0.1:{puerto}?fifo_size=1000000&overrun_nonfatal=1"
+            cap = cv2.VideoCapture(cap_url, cv2.CAP_FFMPEG)
+            if not cap.isOpened():
+                cap.release()
+                proc.terminate()
+                return None
+
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+
+            for _ in range(60):
+                ret, frame = cap.read()
+                if ret and frame is not None and frame.size > 0:
+                    print("[INFO] Cámara CSI detectada y abierta por rpicam-vid (UDP)")
+                    return DetectorCamara.CapturaConProceso(cap, proc, "CSI/rpicam-vid-UDP")
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.03)
+
+            cap.release()
+            proc.terminate()
+        except Exception as e:
+            print(f"[WARN] Falló apertura CSI con rpicam-vid (UDP): {e}")
+
+        return None
+
+    @staticmethod
+    def _abrir_v4l2_por_indice(indice, ancho=640, alto=480):
+        """Abre cámara por V4L2 forzando backend para evitar fallos del backend por defecto."""
+        try:
+            cap = cv2.VideoCapture(indice, cv2.CAP_V4L2)
+            if not cap.isOpened():
+                cap.release()
+                return None
+
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, ancho)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, alto)
+
+            ret, frame = cap.read()
+            if ret and frame is not None and frame.size > 0:
+                return cap
+
+            cap.release()
+        except Exception:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        return None
     
     @staticmethod
     def detectar_camara():
-        """Detecta si hay una cámara disponible"""
-        # Primero verificar si existen dispositivos de video
-        if not DetectorCamara.listar_dispositivos_video():
-            return None
-        
-        # Intenta abrir la cámara
-        print("[INFO] Probando dispositivos de cámara...")
-        for i in range(5):  # Prueba hasta 5 índices
+        """Detecta cámara priorizando CSI y retornando captura abierta + descripción."""
+        dispositivos = DetectorCamara.listar_dispositivos_video()
+
+        print("[INFO] Probando cámara CSI con Picamera2 primero...")
+        cap_picamera2 = DetectorCamara._abrir_csi_picamera2()
+        if cap_picamera2 is not None:
+            return cap_picamera2, "CSI/Picamera2"
+
+        print("[INFO] Picamera2 no disponible. Probando cámara CSI con rpicam-vid...")
+        cap_rpicam = DetectorCamara._abrir_csi_rpicam()
+        if cap_rpicam is not None:
+            return cap_rpicam, "CSI/rpicam-vid"
+
+        print("[INFO] rpicam-vid no disponible o no funcional. Probando libcamerasrc...")
+        cap_csi = DetectorCamara._abrir_csi_libcamera()
+        if cap_csi is not None:
+            return DetectorCamara.CapturaConProceso(cap_csi, None, "CSI/libcamerasrc"), "CSI/libcamerasrc"
+
+        if not dispositivos:
+            return None, None
+
+        print("[INFO] Fallback a cámaras USB/V4L2...")
+        candidatos = []
+        for path_dev in dispositivos:
             try:
-                print(f"[INFO] Intentando /dev/video{i}...", end="", flush=True)
-                cap = cv2.VideoCapture(i)
-                if cap.isOpened():
-                    # Intentar leer un frame para verificar que realmente funciona
-                    ret, frame = cap.read()
-                    cap.release()
-                    if ret and frame is not None and frame.size > 0:
-                        print(" [OK] FUNCIONANDO")
-                        return i
-                    else:
-                        print(" ✗ No devuelve frames")
-                else:
-                    cap.release()
-                    print(" ✗ No se abre")
-            except Exception as e:
-                print(f" ✗ Error: {e}")
-                try:
-                    cap.release()
-                except:
-                    pass
+                idx = int(path_dev.replace('/dev/video', ''))
+                candidatos.append(idx)
+            except ValueError:
                 continue
-        return None
+        candidatos = sorted(set(candidatos))
+
+        for i in candidatos:
+            print(f"[INFO] Intentando /dev/video{i} (V4L2)...", end="", flush=True)
+            cap_usb = DetectorCamara._abrir_v4l2_por_indice(i)
+            if cap_usb is not None:
+                print(" [OK] FUNCIONANDO")
+                return DetectorCamara.CapturaConProceso(cap_usb, None, f"/dev/video{i}"), f"/dev/video{i}"
+            print(" [WARN] no usable")
+
+        return None, None
     
     @staticmethod
     def mostrar_error_camara(sintesis_voz, has_gui, mostrar_popup=True):
@@ -260,6 +502,8 @@ class DetectorObjetosOpenCV:
         self.confianza_minima = config.getfloat('Deteccion', 'confianza_minima', fallback=0.5)
         self.nms_threshold = config.getfloat('Deteccion', 'nms_threshold', fallback=0.4)
         self.fps_objetivo = config.getint('Deteccion', 'fps_objetivo', fallback=1)
+        self.detectar_todos_los_fps = config.getboolean('Deteccion', 'detectar_todos_los_fps', fallback=True)
+        self.intervalo_logs_info = config.getfloat('Sistema', 'intervalo_logs_info', fallback=3.0)
         self.modelo_dir = Path.home() / '.yolo_opencv'
         self.modelo_dir.mkdir(exist_ok=True)
         
@@ -359,11 +603,31 @@ class DetectorObjetosOpenCV:
             # Fallback a cv2.putText si algo falla
             print(f"[WARN] Error renderizando texto UTF-8: {e}")
             return frame
+
+    def dibujar_detecciones(self, frame, detecciones_detalle):
+        """Dibuja recuadros y etiquetas a partir de detecciones guardadas."""
+        if not detecciones_detalle:
+            return frame
+
+        color = (0, 255, 0)
+        for det in detecciones_detalle:
+            x = det['x']
+            y = det['y']
+            w = det['w']
+            h = det['h']
+            etiqueta_espanol = det['etiqueta']
+            confianza = det['confianza']
+
+            cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+            texto = f"{etiqueta_espanol} {confianza:.2f}"
+            frame = self.dibujar_texto_utf8(frame, texto, (x, y - 5), color)
+
+        return frame
     
     def procesar_frame(self, frame):
-        """Procesa un frame y retorna (frame con anotaciones, lista de objetos con confianzas)"""
+        """Procesa un frame y retorna (frame, objetos_con_confianza, detecciones_detalle)."""
         if self.net is None:
-            return frame, []
+            return frame, [], []
         
         altura, ancho = frame.shape[:2]
         
@@ -408,6 +672,7 @@ class DetectorObjetosOpenCV:
         indices = cv2.dnn.NMSBoxes(cajas, confianzas, self.confianza_minima, self.nms_threshold)
         
         objetos_con_confianza = []  # (nombre, confianza)
+        detecciones_detalle = []
         
         if len(indices) > 0:
             for i in indices.flatten():
@@ -418,6 +683,14 @@ class DetectorObjetosOpenCV:
                 # Traducir al español
                 etiqueta_espanol = self.traducir_objeto(etiqueta)
                 objetos_con_confianza.append((etiqueta_espanol, confianza))
+                detecciones_detalle.append({
+                    'x': x,
+                    'y': y,
+                    'w': w,
+                    'h': h,
+                    'etiqueta': etiqueta_espanol,
+                    'confianza': confianza,
+                })
                 
                 # Dibujar rectángulo
                 color = (0, 255, 0)
@@ -439,22 +712,23 @@ class DetectorObjetosOpenCV:
                 self.ultimo_objeto = objeto_actual
                 self.tiempo_ultimo_anuncio = tiempo_actual
         
-        return frame, objetos_con_confianza
+        return frame, objetos_con_confianza, detecciones_detalle
     
     def ejecutar(self):
         """Ejecuta el bucle principal de detección"""
         global HAS_GUI
-        camara_idx = None
+        cap = None
+        camara_desc = None
         intentos = 0
         max_intentos = 30  # Máximo 30 intentos (5 minutos)
         mostrar_popup = True  # Solo mostrar popup la primera vez
         
         # Bucle de detección de cámara
-        while camara_idx is None and intentos < max_intentos:
+        while cap is None and intentos < max_intentos:
             print("[INFO] Buscando cámara web...")
-            camara_idx = DetectorCamara.detectar_camara()
+            cap, camara_desc = DetectorCamara.detectar_camara()
             
-            if camara_idx is None:
+            if cap is None:
                 DetectorCamara.mostrar_error_camara(self.sintesis_voz, HAS_GUI, mostrar_popup)
                 mostrar_popup = False  # No mostrar popup en siguientes intentos
                 intentos += 1
@@ -463,7 +737,7 @@ class DetectorObjetosOpenCV:
                 time.sleep(10)
         
         # Si no se encontró cámara después de todos los intentos
-        if camara_idx is None:
+        if cap is None:
             print("[ERROR] No se pudo detectar ninguna cámara después de múltiples intentos.")
             print("[INFO] Verifica:")
             print("  1. Que la cámara esté conectada")
@@ -476,10 +750,7 @@ class DetectorObjetosOpenCV:
             print("[ERROR] No se pudo cargar el modelo. Saliendo...")
             return
         
-        # Abrir cámara
-        cap = cv2.VideoCapture(camara_idx)
-        
-        # Configurar resolución más baja para mejor rendimiento
+        # Configurar resolución para mejor rendimiento
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         
@@ -495,50 +766,92 @@ class DetectorObjetosOpenCV:
             cap.release()
             return
         
-        print(f"[INFO] Cámara funcionando correctamente - Resolución: {test_frame.shape[1]}x{test_frame.shape[0]}")
+        print(f"[INFO] Cámara activa: {camara_desc} - Resolución: {test_frame.shape[1]}x{test_frame.shape[0]}")
         print("[INFO] Iniciando detección de objetos...")
         print("[INFO] Presiona 'q' o ESC para salir")
         
         frames_procesados = 0
         fps_start_time = time.time()
         fps_counter = 0
+        ultimo_tiempo_deteccion = 0.0
+        intervalo_deteccion = 0.0 if self.detectar_todos_los_fps else (1.0 / self.fps_objetivo if self.fps_objetivo > 0 else 0.0)
+        ultimos_objetos_detectados = []
+        ultimas_detecciones_detalle = []
+        ultimo_log_info = time.time()
+        ultimo_log_deteccion = 0.0
+        errores_lectura_consecutivos = 0
+        max_errores_lectura = 25
         
         try:
             while True:
                 ret, frame = cap.read()
                 
                 if not ret or frame is None or frame.size == 0:
-                    print("[WARN] No se pudo leer frame de la cámara")
-                    time.sleep(0.1)
+                    errores_lectura_consecutivos += 1
+                    if errores_lectura_consecutivos == 1 or errores_lectura_consecutivos % 10 == 0:
+                        print(f"[WARN] No se pudo leer frame de la cámara ({errores_lectura_consecutivos})")
+
+                    if errores_lectura_consecutivos >= max_errores_lectura:
+                        print("[WARN] Se perdió el stream de cámara. Intentando reconexión...")
+                        try:
+                            cap.release()
+                        except Exception:
+                            pass
+
+                        cap, camara_desc = DetectorCamara.detectar_camara()
+                        if cap is None:
+                            print("[ERROR] No se pudo reconectar la cámara")
+                            break
+
+                        print(f"[INFO] Reconectado a cámara: {camara_desc}")
+                        errores_lectura_consecutivos = 0
+                        time.sleep(0.2)
+                        continue
+
+                    time.sleep(0.02)
                     continue
+
+                errores_lectura_consecutivos = 0
                 
                 frames_procesados += 1
                 fps_counter += 1
                 
-                # Procesar cada frame para no perder detecciones
-                frame_procesado, objetos_detectados = self.procesar_frame(frame)
+                # Mostrar vídeo siempre fluido y limitar solo la frecuencia de detección
+                frame_procesado = frame.copy()
+                objetos_detectados = []
+                tiempo_actual = time.time()
+
+                if (intervalo_deteccion == 0.0) or (tiempo_actual - ultimo_tiempo_deteccion >= intervalo_deteccion):
+                    frame_procesado, objetos_detectados, detecciones_detalle = self.procesar_frame(frame.copy())
+                    ultimo_tiempo_deteccion = tiempo_actual
+                    ultimos_objetos_detectados = objetos_detectados
+                    ultimas_detecciones_detalle = detecciones_detalle
+
+                    # Mostrar objetos detectados en consola con timestamp (limitado)
+                    if objetos_detectados and (tiempo_actual - ultimo_log_deteccion >= self.intervalo_logs_info):
+                        objetos_str = ", ".join([f"{obj[0]} ({obj[1]*100:.0f}%)" for obj in objetos_detectados])
+                        print_detection(f"[DETECCIÓN] {objetos_str}")
+                        ultimo_log_deteccion = tiempo_actual
+                elif ultimos_objetos_detectados:
+                    # Mantener recuadros y etiquetas en frames intermedios
+                    frame_procesado = self.dibujar_detecciones(frame_procesado, ultimas_detecciones_detalle)
                 
-                # Mostrar objetos detectados en consola con timestamp
-                if objetos_detectados:
-                    objetos_str = ", ".join([f"{obj[0]} ({obj[1]*100:.0f}%)" for obj in objetos_detectados])
-                    print_detection(f"[DETECCIÓN] {objetos_str}")
-                
-                # Calcular y mostrar FPS cada 10 frames
-                if fps_counter >= 10:
+                # Calcular y mostrar FPS cada N segundos
+                if tiempo_actual - ultimo_log_info >= self.intervalo_logs_info:
                     fps = fps_counter / (time.time() - fps_start_time)
                     print(f"[INFO] FPS: {fps:.1f}")
                     fps_counter = 0
                     fps_start_time = time.time()
+                    ultimo_log_info = tiempo_actual
                 
                 # Mostrar frame si hay GUI
                 if HAS_GUI:
                     try:
                         # Nombre simple de ventana
                         cv2.imshow('YOLO Detector - Presiona q o ESC', frame_procesado)
-                        
-                        # Delay basado en fps_objetivo desde config
-                        delay_ms = max(1, 1000 // self.fps_objetivo) if self.fps_objetivo > 0 else 1000
-                        key = cv2.waitKey(delay_ms) & 0xFF
+
+                        # Refresco de GUI siempre rápido para evitar congelación visual
+                        key = cv2.waitKey(1) & 0xFF
                         if key == ord('q') or key == ord('Q') or key == 27:  # q, Q o ESC
                             print("[INFO] Saliendo...")
                             break
@@ -547,42 +860,60 @@ class DetectorObjetosOpenCV:
                         HAS_GUI = False
                         print("[INFO] Cambiando a modo headless")
                 else:
-                    # Modo headless: esperar según fps_objetivo
-                    sleep_time = (1.0 / self.fps_objetivo) if self.fps_objetivo > 0 else 1.0
-                    time.sleep(sleep_time)
+                    # Modo headless: espera corta para no saturar CPU
+                    time.sleep(0.01)
         
         except KeyboardInterrupt:
             print("\n[INFO] Interrupción del usuario. Saliendo...")
         
         finally:
             # Liberar recursos
-            cap.release()
+            try:
+                cap.release()
+            except KeyboardInterrupt:
+                pass
+            except Exception:
+                pass
+
             if HAS_GUI:
-                cv2.destroyAllWindows()
+                try:
+                    cv2.destroyAllWindows()
+                except Exception:
+                    pass
             print("[INFO] Recursos liberados. Programa terminado.")
 
 
 def verificar_dependencias():
     """Verifica las dependencias necesarias"""
     print("[INFO] Verificando dependencias...")
-    
-    dependencias = [
-        ('cv2', 'opencv-python'),
+
+    dependencias_requeridas = [
+        ('cv2', 'opencv-python')
+    ]
+    dependencias_opcionales = [
         ('pyttsx3', 'pyttsx3')
     ]
-    
-    faltantes = []
-    for modulo, paquete in dependencias:
+
+    faltantes_requeridas = []
+    for modulo, paquete in dependencias_requeridas:
         try:
             __import__(modulo)
             print(f"[OK] {modulo} está instalado")
         except ImportError:
             print(f"[WARN] {modulo} no está instalado")
-            faltantes.append(paquete)
-    
-    if faltantes:
-        print(f"\n[ERROR] Faltan dependencias: {', '.join(faltantes)}")
-        print("Instálalas con: pip install opencv-python pyttsx3")
+            faltantes_requeridas.append(paquete)
+
+    for modulo, _ in dependencias_opcionales:
+        try:
+            __import__(modulo)
+            print(f"[OK] {modulo} está instalado")
+        except ImportError:
+            print(f"[WARN] {modulo} no está instalado (modo sin voz disponible)")
+
+    if faltantes_requeridas:
+        print(f"\n[ERROR] Faltan dependencias requeridas: {', '.join(faltantes_requeridas)}")
+        print("Instálalas en el venv con:")
+        print("  source venv/bin/activate && pip install -r requirements.txt")
         sys.exit(1)
 
 

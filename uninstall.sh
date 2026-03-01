@@ -1,5 +1,6 @@
 #!/bin/bash
 # Script de desinstalación
+# Alejandro Paredero - alejandro.paredero@cunef.edu
 
 echo "=============================================="
 echo "  Desinstalador - Detector YOLO"
@@ -16,7 +17,7 @@ fi
 
 echo ""
 echo "[INFO] Limpiando caché de modelos YOLO..."
-rm -rf ~/.cache/ultralytics/
+rm -rf ~/.yolo_opencv/
 
 echo ""
 echo "[INFO] Los archivos del proyecto no se han eliminado"

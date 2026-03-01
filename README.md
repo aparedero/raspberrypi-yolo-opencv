@@ -1,6 +1,7 @@
 # Detector de Objetos YOLO para Raspberry Pi 4
 
 Sistema de detección de objetos en tiempo real usando YOLO con síntesis de voz en español para Raspberry Pi 4.
+_Alejandro Paredero de Dios - alejandro.paredero@cunef.edu_
 
 ## Tecnología
 
@@ -26,7 +27,7 @@ Sistema de detección de objetos en tiempo real usando YOLO con síntesis de voz
 - Raspberry Pi 4 con 4GB u 8GB de RAM
 - Raspberry Pi OS de 32 o 64 bits
 - Python 3.7 o versiones posteriores
-- Dispositivo de captura USB compatible con V4L2
+- Cámara CSI compatible con libcamera o cámara USB compatible con V4L2
 - Sistema de salida de audio (altavoces o auriculares)
 
 ## Instalación
@@ -66,6 +67,9 @@ sudo apt-get install -y python3-pip python3-dev python3-venv python3-full
 sudo apt-get install -y libportaudio2 portaudio19-dev
 sudo apt-get install -y espeak espeak-data
 sudo apt-get install -y libatlas-base-dev libopenblas-dev
+sudo apt-get install -y python3-picamera2
+sudo apt-get install -y rpicam-apps
+sudo apt-get install -y gstreamer1.0-libcamera libcamera-apps
 sudo apt-get install -y libavcodec-dev libavformat-dev libswscale-dev
 ```
 
@@ -87,6 +91,11 @@ chmod +x yolo_detector_opencv.py
 ```
 
 ## Uso
+
+Todos los scripts de ejecución siguen el mismo comportamiento:
+- No requieren `sudo` (si se usa, re-ejecutan como usuario normal)
+- Activan automáticamente el entorno virtual `venv`
+- Para cámara: prioridad CSI (libcamera) y fallback automático a USB (V4L2)
 
 ### Modo GUI (Con Interfaz Gráfica)
 
@@ -114,6 +123,8 @@ Ejecución sin servidor gráfico:
 ./run_headless.sh
 ```
 
+`run_headless.sh` ejecuta el mismo flujo interno que `run_gui.sh` (mismo detector, misma lógica de fallback de cámara y misma configuración), cambiando únicamente la visualización por pantalla.
+
 Para detener el proceso, usar **Ctrl+C**.
 
 ### Verificación de Cámara
@@ -137,7 +148,16 @@ Estos archivos se almacenan en `~/.yolo_opencv/` para su reutilización posterio
 
 ### Detección de Cámara
 
-El sistema implementa detección automática de dispositivos de video con mecanismo de reintento (hasta 30 intentos por defecto).
+El sistema usa el siguiente orden para cámara CSI:
+1. `Picamera2` (preferente, más estable en Raspberry Pi)
+2. `rpicam-vid` por UDP
+3. `libcamerasrc`
+
+Si la cámara CSI no está disponible, realiza fallback automático a cámaras USB por V4L2 (`/dev/video*`).
+Incluye mecanismo de reintento (hasta 30 intentos por defecto).
+En modo Picamera2 la captura se hace de forma asíncrona (buffer de último frame) para evitar bloqueos y congelaciones de la ventana.
+
+Este comportamiento se aplica tanto en el detector principal (`yolo_detector_opencv.py`) como en la prueba de cámara (`test_camera.py`).
 
 ### Detección de Objetos
 
@@ -165,6 +185,9 @@ confianza_minima = 0.5
 # FPS objetivo: velocidad de procesamiento (1, 2, 5, 10, 30, etc)
 fps_objetivo = 1
 
+# Detectar con YOLO en todos los frames (true/false)
+detectar_todos_los_fps = true
+
 [Voz]
 # Intervalo mínimo entre anuncios en segundos (evita ruido)
 intervalo_anuncio = 4.0
@@ -183,6 +206,9 @@ max_intentos_camara = 30
 [Sistema]
 # Mostrar timestamp en cada mensaje de detección
 mostrar_timestamp = true
+
+# Intervalo mínimo entre mensajes de consola [INFO]/[DETECCIÓN]
+intervalo_logs_info = 3.0
 ```
 
 ### Modificación de Parámetros
@@ -190,8 +216,16 @@ mostrar_timestamp = true
 Los parámetros se configuran mediante el archivo `config.ini`:
 
 **FPS de procesamiento:**
-- `fps_objetivo = 1` procesamiento a baja velocidad
-- `fps_objetivo = 30` procesamiento a máxima velocidad
+- `fps_objetivo = 1` detección una vez por segundo con visualización fluida
+- `fps_objetivo = 5` detección cinco veces por segundo
+- La ventana GUI se refresca de forma continua para evitar imagen congelada
+
+**Recuadros en todos los FPS:**
+- `detectar_todos_los_fps = true` aplica YOLO en cada frame para mantener recuadros continuamente
+- `detectar_todos_los_fps = false` usa `fps_objetivo` para detección y mantiene recuadros con la última detección
+
+**Frecuencia de logs en consola:**
+- `intervalo_logs_info = 3.0` limita mensajes `[INFO]` y `[DETECCIÓN]` a un máximo de uno cada 3 segundos
 
 **Umbral de detección:**
 - `confianza_minima = 0.5` valor predeterminado
@@ -236,6 +270,8 @@ Ejecutar el script de instalación:
 2. Comprobar dispositivos disponibles: `ls /dev/video*`
 3. Verificar permisos de grupo: `sudo usermod -a -G video $USER`
 4. Reiniciar sesión tras modificar permisos
+5. Probar cámara CSI directamente: `rpicam-hello`
+6. Verificar app de CSI: `rpicam-vid --help`
 
 ### Sin salida de audio
 
@@ -256,24 +292,40 @@ Opciones de optimización:
 2. Disminuir resolución de captura
 3. Finalizar procesos innecesarios en segundo plano
 
+### Aviso: "Circular buffer overrun" en CSI
+
+Si aparece este aviso en captura CSI:
+- El sistema aplica opciones de mitigación en UDP (`fifo_size` y `overrun_nonfatal`)
+- Se reduce automáticamente la tasa de stream de CSI según `fps_objetivo`
+- La detección se limita por frecuencia, pero la vista sigue en tiempo real
+- Si persiste, instalar y usar `python3-picamera2` para evitar ruta FFmpeg/GStreamer
+
 ### Error: "externally-managed-environment"
 
 Este problema se resuelve mediante el uso de entornos virtuales implementado en el script de instalación:
 1. Utilizar `./install.sh` para la instalación
 2. Ejecutar mediante `./run_gui.sh` o `./run_headless.sh`
+3. No ejecutar scripts con `sudo`, ya que puede omitir el entorno virtual del usuario
 
 ## Estructura del Proyecto
 
 ```
 .
-├── yolo_detector_opencv.py    Script principal
+├── .gitignore                 Exclusiones de control de versiones
+├── README.md                  Esta documentación
 ├── config.ini                 Configuración
-├── requirements.txt           Dependencias Python
 ├── install.sh                 Script de instalación
+├── install_log.txt            Registro de instalación
+├── requirements.txt           Dependencias Python
 ├── run_gui.sh                 Ejecución con GUI
 ├── run_headless.sh            Ejecución sin GUI
-├── test_camera.sh             Prueba de cámara
-└── README.md                  Esta documentación
+├── test_camera.py             Lógica de prueba CSI/USB
+├── test_camera.sh             Script de prueba de cámara
+├── uninstall.sh               Script de desinstalación
+├── yolo_detector_opencv.py    Script principal
+├── venv/                      Entorno virtual local (generado)
+├── __pycache__/               Caché de bytecode (generado)
+└── .git/                      Metadatos del repositorio
 ```
 
 ## Objetos Detectables
